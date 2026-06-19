@@ -39,7 +39,7 @@ npm install --save-dev @ai-hero/sandcastle
 npx @ai-hero/sandcastle init
 ```
 
-3. Edit `.sandcastle/.env` and fill in your default values for `ANTHROPIC_API_KEY`. If you want to use your Claude subscription instead of an API key, see [#191](https://github.com/mattpocock/sandcastle/issues/191).
+3. Edit `.sandcastle/.env` and fill in your default values for `CLAUDE_CODE_OAUTH_TOKEN` (run `claude setup-token` on your host to get one). To use an Anthropic API key instead, uncomment and fill in `ANTHROPIC_API_KEY`.
 
 ```bash
 cp .sandcastle/.env.example .sandcastle/.env
@@ -218,14 +218,20 @@ const result = await run({
     type: "file",
     path: ".sandcastle/logs/my-run.log",
     // Optional: forward the agent's output stream to your own observability system.
-    // Fires for each text chunk and tool call the agent produces. Errors thrown
-    // by the callback are swallowed so a broken forwarder cannot kill the run.
+    // Fires for each text chunk, tool call, and raw stdout line the agent
+    // produces. Errors thrown by the callback are swallowed so a broken
+    // forwarder cannot kill the run.
     onAgentStreamEvent: (event) => {
-      // event is { type: "text" | "toolCall", iteration, timestamp, ... }
+      // event is { type: "text" | "toolCall" | "raw", iteration, timestamp, ... }
       myLogger.info(event);
     },
+    // Optional: append every raw stdout line the agent emits to the same
+    // log file, interleaved with the human-readable output. Includes lines
+    // the provider's stream parser would otherwise drop. Intended for
+    // debugging stuck or unexpected agent behaviour.
+    verbose: true,
   },
-  // logging: { type: "stdout" }, // OR render an interactive UI in the terminal
+  // logging: { type: "stdout", verbose: true }, // OR terminal mode (verbose: raw lines to stdout)
 
   // String (or array of strings) the agent emits to end the iteration loop early.
   // Default: "<promise>COMPLETE</promise>"
@@ -305,6 +311,35 @@ const reviewResult = await sandbox.run({
 
 Commits from all `run()` calls accumulate on the same branch. The sandbox container stays alive between runs, so installed dependencies and build artifacts persist.
 
+`sandbox.exec()` lets the harness run shell commands directly in the same warm sandbox — handy for gating an implement step on a quick verification before kicking off the review:
+
+```typescript
+await using sandbox = await createSandbox({
+  branch: "agent/fix-42",
+  sandbox: docker(),
+  hooks: { sandbox: { onSandboxReady: [{ command: "npm install" }] } },
+});
+
+await sandbox.run({
+  agent: claudeCode("claude-opus-4-7"),
+  promptFile: ".sandcastle/implement.md",
+  maxIterations: 5,
+});
+
+// Verify before review — non-zero exitCode is returned, not thrown.
+const tests = await sandbox.exec("npm test");
+if (tests.exitCode !== 0) {
+  throw new Error(`Tests failed:\n${tests.stdout}\n${tests.stderr}`);
+}
+
+await sandbox.run({
+  agent: claudeCode("claude-sonnet-4-6"),
+  prompt: "Review the changes and fix any issues.",
+});
+```
+
+`cwd` defaults to the sandbox repo path, matching `interactive()`. Pass `cwd` to override.
+
 #### Automatic cleanup with `await using`
 
 `await using` calls `sandbox.close()` automatically when the block exits. If the sandbox has uncommitted changes, the worktree is preserved on disk; if clean, both container and worktree are removed.
@@ -336,40 +371,44 @@ if (closeResult.preservedWorktreePath) {
 
 #### `Sandbox`
 
-| Property / Method       | Type                                                               | Description                                  |
-| ----------------------- | ------------------------------------------------------------------ | -------------------------------------------- |
-| `branch`                | string                                                             | The branch the sandbox is on                 |
-| `worktreePath`          | string                                                             | Host path to the worktree                    |
-| `run(options)`          | `(SandboxRunOptions) => Promise<SandboxRunResult>`                 | Invoke an agent inside the existing sandbox  |
-| `interactive(options)`  | `(SandboxInteractiveOptions) => Promise<SandboxInteractiveResult>` | Launch an interactive session in the sandbox |
-| `close()`               | `() => Promise<CloseResult>`                                       | Tear down the container and sandbox          |
-| `[Symbol.asyncDispose]` | `() => Promise<void>`                                              | Auto teardown via `await using`              |
+| Property / Method       | Type                                                                     | Description                                                                                                               |
+| ----------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| `branch`                | string                                                                   | The branch the sandbox is on                                                                                              |
+| `worktreePath`          | string                                                                   | Host path to the worktree                                                                                                 |
+| `run(options)`          | `(SandboxRunOptions) => Promise<SandboxRunResult>`                       | Invoke an agent inside the existing sandbox                                                                               |
+| `interactive(options)`  | `(SandboxInteractiveOptions) => Promise<SandboxInteractiveResult>`       | Launch an interactive session in the sandbox                                                                              |
+| `exec(cmd, options?)`   | `(command: string, options?: SandboxExecOptions) => Promise<ExecResult>` | Run a shell command in the sandbox. `cwd` defaults to the sandbox repo path. Non-zero `exitCode` is returned, not thrown. |
+| `close()`               | `() => Promise<CloseResult>`                                             | Tear down the container and sandbox                                                                                       |
+| `[Symbol.asyncDispose]` | `() => Promise<void>`                                                    | Auto teardown via `await using`                                                                                           |
 
 #### `SandboxRunOptions`
 
-| Option                     | Type               | Default                       | Description                                                                          |
-| -------------------------- | ------------------ | ----------------------------- | ------------------------------------------------------------------------------------ |
-| `agent`                    | AgentProvider      | —                             | **Required.** Agent provider (e.g. `claudeCode("claude-opus-4-7")`)                  |
-| `prompt`                   | string             | —                             | Inline prompt (mutually exclusive with `promptFile`)                                 |
-| `promptFile`               | string             | —                             | Path to prompt file (mutually exclusive with `prompt`)                               |
-| `promptArgs`               | PromptArgs         | —                             | Key-value map for `{{KEY}}` placeholder substitution                                 |
-| `maxIterations`            | number             | `1`                           | Maximum iterations to run                                                            |
-| `completionSignal`         | string \| string[] | `<promise>COMPLETE</promise>` | String(s) the agent emits to stop the iteration loop early                           |
-| `idleTimeoutSeconds`       | number             | `600`                         | Idle timeout in seconds — resets on each agent output event                          |
-| `completionTimeoutSeconds` | number             | `60`                          | Grace window after the completion signal is seen but the agent process hasn't exited |
-| `name`                     | string             | —                             | Display name for the run                                                             |
-| `logging`                  | object             | file (auto-generated)         | `{ type: 'file', path }` or `{ type: 'stdout' }`                                     |
-| `signal`                   | AbortSignal        | —                             | Cancels the run when aborted; handle stays usable afterward                          |
+| Option                     | Type               | Default                       | Description                                                                                                                          |
+| -------------------------- | ------------------ | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `agent`                    | AgentProvider      | —                             | **Required.** Agent provider (e.g. `claudeCode("claude-opus-4-7")`)                                                                  |
+| `prompt`                   | string             | —                             | Inline prompt (mutually exclusive with `promptFile`)                                                                                 |
+| `promptFile`               | string             | —                             | Path to prompt file (mutually exclusive with `prompt`)                                                                               |
+| `promptArgs`               | PromptArgs         | —                             | Key-value map for `{{KEY}}` placeholder substitution                                                                                 |
+| `maxIterations`            | number             | `1`                           | Maximum iterations to run                                                                                                            |
+| `completionSignal`         | string \| string[] | `<promise>COMPLETE</promise>` | String(s) the agent emits to stop the iteration loop early                                                                           |
+| `idleTimeoutSeconds`       | number             | `600`                         | Idle timeout in seconds — resets on each agent output event                                                                          |
+| `completionTimeoutSeconds` | number             | `60`                          | Grace window after the completion signal is seen but the agent process hasn't exited                                                 |
+| `name`                     | string             | —                             | Display name for the run                                                                                                             |
+| `logging`                  | object             | file (auto-generated)         | `{ type: 'file', path }` or `{ type: 'stdout' }`                                                                                     |
+| `resumeSession`            | string             | —                             | Resume a prior session by ID for agents that support resume. Incompatible with `maxIterations > 1`. Session file must exist on host. |
+| `signal`                   | AbortSignal        | —                             | Cancels the run when aborted; handle stays usable afterward                                                                          |
 
 #### `SandboxRunResult`
 
-| Field              | Type                | Description                                                        |
-| ------------------ | ------------------- | ------------------------------------------------------------------ |
-| `iterations`       | `IterationResult[]` | Per-iteration results (use `.length` for the count)                |
-| `completionSignal` | string?             | The matched completion signal string, or `undefined` if none fired |
-| `stdout`           | string              | Combined agent output from all iterations                          |
-| `commits`          | `{ sha }[]`         | Commits created during the run                                     |
-| `logFilePath`      | string?             | Path to the log file (only when logging to a file)                 |
+| Field                      | Type                                                                                     | Description                                                                                                                         |
+| -------------------------- | ---------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `iterations`               | `IterationResult[]`                                                                      | Per-iteration results (use `.length` for the count)                                                                                 |
+| `completionSignal`         | string?                                                                                  | The matched completion signal string, or `undefined` if none fired                                                                  |
+| `stdout`                   | string                                                                                   | Combined agent output from all iterations                                                                                           |
+| `commits`                  | `{ sha }[]`                                                                              | Commits created during the run                                                                                                      |
+| `logFilePath`              | string?                                                                                  | Path to the log file (only when logging to a file)                                                                                  |
+| `resume(prompt, options?)` | `(prompt: string, options?: ResumeSandboxRunResultOptions) => Promise<SandboxRunResult>` | Continue the captured session for one iteration inside the same warm sandbox. Present only when the provider captured a session id. |
+| `fork(prompt, options?)`   | `(prompt: string, options?: ResumeSandboxRunResultOptions) => Promise<SandboxRunResult>` | Fork the captured session for one iteration inside the same warm sandbox. The parent session is left intact (ADR 0018).             |
 
 #### `CloseResult`
 
@@ -427,6 +466,8 @@ await sandbox.close();
 ```
 
 `wt.close()` checks for uncommitted changes: if the worktree is dirty, it's preserved on disk; if clean, it's removed. `await using` calls `close()` automatically. The worktree persists after `run()`, `interactive()`, and `createSandbox()` complete, so you can hand it to another agent or inspect it.
+
+With `branchStrategy: { type: "merge-to-head" }`, each `wt.run()` / `wt.interactive()` merges the agent's commits back to the host's current branch before returning, and the worktree's source branch is preserved across calls so subsequent ones can reuse the same handle. (This differs from top-level `run()`, where the temp branch is deleted after the merge.)
 
 **Split ownership**: When a sandbox is created via `wt.createSandbox()`, `sandbox.close()` tears down the container only — the worktree remains. `wt.close()` is responsible for worktree cleanup. This differs from the top-level `createSandbox()`, where `sandbox.close()` owns both container and worktree.
 
@@ -669,7 +710,24 @@ console.log(result.output.score); // typed as number
 
 `Output.string({ tag })` extracts the tag contents as a plain string (trimmed, no JSON parsing). Both helpers require `maxIterations` to be `1` (the default). The resolved prompt must contain the configured opening tag literal.
 
-When extraction or validation fails, `run()` throws a `StructuredOutputError`. Alongside `tag`, `rawMatched`, `cause`, `commits`, `branch`, and `preservedWorktreePath`, the error carries the `sessionId` (and `sessionFilePath`, when the session was captured) of the run that produced the bad output. You can resume that session to ask the agent to re-emit corrected output, without repeating the work:
+When extraction or validation fails, `run()` throws a `StructuredOutputError`. Alongside `tag`, `rawMatched`, `cause`, `commits`, `branch`, and `preservedWorktreePath`, the error carries the `sessionId` (and `sessionFilePath`, when the session was captured) of the run that produced the bad output.
+
+Pass `maxRetries` to have Sandcastle handle the retry loop for you. Each retry resumes the same agent session and feeds back a token-efficient description of the error, so the agent can re-emit a corrected tag without redoing the work. Retries require an agent provider that supports session resumption (`claudeCode`, `codex`, `pi`) — calling `run()` with `maxRetries > 0` against a non-resumable provider (`cursor`, `opencode`, `copilot`) throws immediately.
+
+```ts
+const result = await run({
+  agent: claudeCode("claude-opus-4-7"),
+  sandbox: docker(),
+  prompt: "Analyze the code and emit JSON inside <result> tags.",
+  output: Output.object({
+    tag: "result",
+    schema: z.object({ summary: z.string(), score: z.number() }),
+    maxRetries: 2, // 2 retries on top of the initial attempt
+  }),
+});
+```
+
+If you need to drive the retry loop manually — for example, to customise the feedback prompt or rotate models on each attempt — leave `maxRetries` at its default of `0` and resume the failed session yourself:
 
 ```ts
 import { run, Output, StructuredOutputError } from "@ai-hero/sandcastle";
@@ -827,6 +885,8 @@ Removes the Podman image.
 ### Session capture
 
 After each resumable provider iteration, Sandcastle automatically captures the agent's session file from the sandbox to the host. Claude Code sessions are stored under `~/.claude/projects/<encoded-path>/<session-id>.jsonl`; Codex sessions are stored under `~/.codex/sessions/YYYY/MM/DD/rollout-*-<session-id>.jsonl`; Pi sessions are stored under `~/.pi/agent/sessions/--<encoded-cwd>--/<timestamp>_<session-id>.jsonl`. Any provider-specific `cwd` fields are rewritten to match the host repo root, so the provider's native resume command works.
+
+For Claude Code, any `Agent`-tool or `Workflow`-tool subagent transcripts written under `<session-id>/subagents/agent-*.jsonl` are captured alongside the main session. Subagent capture is best-effort: a failure on an individual transcript logs a warning and lets siblings and the main session through. Main-session capture failure still fails the run (see below).
 
 Session capture is enabled by default for `claudeCode()`, `codex()`, and `pi()` and can be opted out via `captureSessions: false`. Providers without `sessionStorage` do not attempt capture. Capture failure fails the run.
 

@@ -15,8 +15,10 @@ export type {
   Sandbox,
   SandboxRunOptions,
   SandboxRunResult,
+  ResumeSandboxRunResultOptions,
   SandboxInteractiveOptions,
   SandboxInteractiveResult,
+  SandboxExecOptions,
   CloseResult,
 } from "./createSandbox.js";
 export { createWorktree } from "./createWorktree.js";
